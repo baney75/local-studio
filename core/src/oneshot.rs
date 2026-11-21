@@ -83,7 +83,8 @@ impl TextGen {
     }
 }
 
-async fn resolved_provider(client: &DaemonClient, active: &str) -> Result<Option<String>, String> {
+/// The provider of the model the session `active` actually runs on, read from the daemon.
+pub(crate) async fn resolved_provider(client: &DaemonClient, active: &str) -> Result<Option<String>, String> {
     let state = client
         .request_ok(DaemonCommand::GetState { id: None, active_session_id: active.to_string(), rest: Map::default() })
         .await

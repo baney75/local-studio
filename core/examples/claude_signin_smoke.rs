@@ -21,6 +21,10 @@ const SIGNED_IN: &str = r#"{"anthropic":{"type":"oauth","refresh":"","access":""
 const API_KEY: &str = r#"{"anthropic":{"type":"api_key","key":"sk-ant-local-studio-fake-not-real"}}"#;
 const HAIKU: &str = "claude-haiku-5-5";
 const DEFAULT_HAIKU: &str = r#"{"defaultProvider":"anthropic","defaultModel":"claude-haiku-5-5"}"#;
+const STUB: &str = "smoke-stub";
+/// A keyless endpoint on a closed loopback port: listed and selectable, and no model ever answers on it.
+const STUB_MODELS: &str = r#"{"providers":{"smoke-stub":{"name":"Smoke stub","baseUrl":"http://127.0.0.1:9/v1","api":"openai-completions","apiKey":"none","models":[{"id":"stub-1","name":"stub-1"}]}}}"#;
+const DEFAULT_STUB: &str = r#"{"defaultProvider":"smoke-stub","defaultModel":"stub-1"}"#;
 
 #[derive(Default)]
 struct Signal {
@@ -60,6 +64,7 @@ struct View {
     default: Option<ModelKey>,
     projects: Vec<Project>,
     settings: Option<Settings>,
+    threads: Vec<String>,
 }
 
 impl View {
@@ -92,9 +97,30 @@ struct Harness {
     studio: Arc<Studio>,
     signal: Arc<Signal>,
     view: View,
+    config: StudioConfig,
 }
 
 impl Harness {
+    fn open(config: StudioConfig) -> anyhow::Result<Self> {
+        let signal = Arc::new(Signal::default());
+        let studio = Studio::new(config.clone(), Arc::clone(&signal) as Arc<dyn Waker>)?;
+        Ok(Self { studio, signal, view: View::default(), config })
+    }
+
+    fn connect(&mut self) -> anyhow::Result<()> {
+        self.pump_until("daemon launched and connected", |view| matches!(view.connection, Some(Connection::Ready)))
+    }
+
+    /// Shuts this Studio down, runs `between`, and opens a second Studio on the same data dir and daemon.
+    fn restart(&mut self, between: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
+        self.studio.shutdown();
+        println!("ok   the Studio shut down");
+        between()?;
+        let next = Self::open(self.config.clone())?;
+        *self = next;
+        self.connect()
+    }
+
     fn pump_until(&mut self, step: &str, done: impl Fn(&View) -> bool) -> anyhow::Result<()> {
         self.pump_within(step, STEP_TIMEOUT, done)
     }
@@ -138,6 +164,7 @@ impl Harness {
             }
             Update::Projects { projects } => view.projects = projects,
             Update::Settings { settings } => view.settings = Some(settings),
+            Update::Threads { threads } => view.threads = threads.into_iter().map(|row| row.id).collect(),
             _ => {}
         }
     }
@@ -145,6 +172,10 @@ impl Harness {
 
 fn prompt(text: &str) -> PromptDraft {
     PromptDraft { text: text.to_string(), images: Vec::new(), files: Vec::new() }
+}
+
+fn unset(worktree: WorktreeChoice) -> ThreadSettings {
+    ThreadSettings { provider: None, model: None, thinking_level: None, access: AccessMode::Supervised, worktree }
 }
 
 fn on(model: &str, worktree: WorktreeChoice) -> ThreadSettings {
@@ -174,6 +205,42 @@ fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn replace_private(path: &Path, content: &str) -> anyhow::Result<()> {
+    std::fs::remove_file(path).with_context(|| path.display().to_string())?;
+    write_private(path, content)
+}
+
+fn agent_dir() -> anyhow::Result<PathBuf> {
+    Ok(PathBuf::from(std::env::var_os("EUKHE_CODING_AGENT_DIR").context("agent dir")?))
+}
+
+/// Whether any file under `dir` holds `text`, so a refused prompt can be shown never to reach a session.
+fn any_file_holds(dir: &Path, text: &str) -> anyhow::Result<bool> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Ok(false) };
+    for entry in entries {
+        let path = entry?.path();
+        if path.is_dir() {
+            if any_file_holds(&path, text)? {
+                return Ok(true);
+            }
+        } else if std::fs::read(&path).is_ok_and(|bytes| String::from_utf8_lossy(&bytes).contains(text)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Waits until nothing accepts on `socket`, so the next Studio launches a fresh daemon.
+fn daemon_gone(socket: &Path) -> anyhow::Result<()> {
+    let deadline = Instant::now() + REFUSAL_TIMEOUT;
+    while std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        ensure!(Instant::now() < deadline, "the daemon still answers on {}", socket.display());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    println!("ok   the daemon is gone");
+    Ok(())
+}
+
 fn stop_daemon(socket: &Path) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     runtime.block_on(async {
@@ -198,6 +265,7 @@ fn main() -> anyhow::Result<()> {
     std::env::set_var("LOCAL_STUDIO_CLAUDE_BIN", root.join("no-claude"));
     run(&daemon, &root.join("oauth"), SIGNED_IN, Some(DEFAULT_HAIKU), signed_in)?;
     run(&daemon, &root.join("key"), API_KEY, None, api_key)?;
+    run(&daemon, &root.join("project"), SIGNED_IN, Some(DEFAULT_STUB), project_default_refused)?;
     println!("PASS claude signin smoke ({})", root.display());
     Ok(())
 }
@@ -214,7 +282,7 @@ fn run(
     std::fs::create_dir_all(&agent)?;
     std::fs::create_dir_all(&home)?;
     write_private(&agent.join("auth.json"), auth)?;
-    write_private(&agent.join("models.json"), r#"{"providers":{}}"#)?;
+    write_private(&agent.join("models.json"), STUB_MODELS)?;
     if let Some(settings) = eukhe_settings {
         write_private(&agent.join("settings.json"), settings)?;
     }
@@ -230,23 +298,20 @@ fn run(
         launch: Some(DaemonLaunch { program: daemon.to_string_lossy().into_owned() }),
         controller_main: None,
     };
-    let signal = Arc::new(Signal::default());
-    let outcome =
-        Studio::new(config, Arc::clone(&signal) as Arc<dyn Waker>).map_err(anyhow::Error::from).and_then(|studio| {
-            let mut harness = Harness { studio, signal, view: View::default() };
-            let outcome = harness
-                .pump_until("daemon launched and connected", |view| matches!(view.connection, Some(Connection::Ready)))
-                .and_then(|()| {
-                    harness.studio.load_models();
-                    harness.studio.load_providers();
-                    harness.pump_until("Eukhe's model catalog and the providers reached the GUI", |view| {
-                        view.eukhe_loaded() && view.anthropic().is_some() && view.default_seen
-                    })
+    let outcome = Harness::open(config).and_then(|mut harness| {
+        let outcome = harness
+            .connect()
+            .and_then(|()| {
+                harness.studio.load_models();
+                harness.studio.load_providers();
+                harness.pump_until("Eukhe's model catalog and the providers reached the GUI", |view| {
+                    view.eukhe_loaded() && view.anthropic().is_some() && view.default_seen
                 })
-                .and_then(|()| check(&mut harness));
-            harness.studio.shutdown();
-            outcome
-        });
+            })
+            .and_then(|()| check(&mut harness));
+        harness.studio.shutdown();
+        outcome
+    });
     let stopped = stop_daemon(&socket);
     outcome?;
     stopped
@@ -285,6 +350,7 @@ fn signed_in(harness: &mut Harness) -> anyhow::Result<()> {
     worktree_left_alone(harness)?;
     title_skipped(harness)?;
     commit_message_skipped(harness)?;
+    project_default_allowed(harness)?;
     Ok(())
 }
 
@@ -308,24 +374,25 @@ fn default_model_refused(harness: &mut Harness) -> anyhow::Result<()> {
         default.as_ref().is_some_and(|key| key.provider == ANTHROPIC),
         "the daemon default is not anthropic, so the scenario proves nothing: {default:?}"
     );
-    let settings = ThreadSettings {
-        provider: None,
-        model: None,
-        thinking_level: None,
-        access: AccessMode::Supervised,
-        worktree: WorktreeChoice::Local,
-    };
-    harness.studio.start_thread("default-draft".to_string(), None, prompt("ping"), settings);
+    harness.studio.start_thread("default-draft".to_string(), None, prompt("ping"), unset(WorktreeChoice::Local));
     let refusal = refused_start(harness, "default-draft", "an Eukhe thread with no provider")?;
     println!("ok   a thread on Eukhe's anthropic default is refused: {refusal}");
     Ok(())
 }
 
-fn worktree_left_alone(harness: &mut Harness) -> anyhow::Result<()> {
+/// Makes a git repo named `name` beside the data dir with `files` committed, adds it as a project, and returns
+/// its path and project id.
+fn project_repo(harness: &mut Harness, name: &str, files: &[(&str, &str)]) -> anyhow::Result<(PathBuf, String)> {
     let data = PathBuf::from(std::env::var_os("LOCAL_STUDIO_DATA_DIR").context("data dir")?);
-    let repo = data.parent().context("run dir")?.join("repo");
+    let repo = data.parent().context("run dir")?.join(name);
     std::fs::create_dir_all(&repo)?;
     git(&repo, &["init", "--quiet", "--initial-branch", "main"])?;
+    for (path, content) in files {
+        let path = repo.join(path);
+        std::fs::create_dir_all(path.parent().context("file dir")?)?;
+        std::fs::write(&path, content)?;
+    }
+    git(&repo, &["add", "--all"])?;
     git(
         &repo,
         &[
@@ -342,20 +409,71 @@ fn worktree_left_alone(harness: &mut Harness) -> anyhow::Result<()> {
     )?;
     let repo = std::fs::canonicalize(&repo)?;
     harness.studio.add_project(repo.to_string_lossy().into_owned());
-    harness.pump_until("the scratch repo is a project", |view| {
+    harness.pump_until(&format!("the scratch repo {name} is a project"), |view| {
         view.projects.iter().any(|project| Path::new(&project.path) == repo)
     })?;
     let project =
         harness.view.projects.iter().find(|project| Path::new(&project.path) == repo).context("project")?.id.clone();
-    let before = git(&repo, &["branch", "--list", "local-studio/*"])?;
-    let worktree = WorktreeChoice::NewWorktree { branch: "local-studio/1".to_string(), base: None };
-    harness.studio.start_thread("worktree-draft".to_string(), Some(project), prompt("ping"), on(HAIKU, worktree));
-    let refusal = refused_start(harness, "worktree-draft", "an Eukhe anthropic thread in a new worktree")?;
-    let after = git(&repo, &["branch", "--list", "local-studio/*"])?;
+    Ok((repo, project))
+}
+
+/// Starts `settings` in a new worktree of `repo`, requires the refusal, and requires no branch or worktree left.
+fn worktree_refused(
+    harness: &mut Harness,
+    repo: &Path,
+    project: String,
+    draft: &str,
+    branch: &str,
+    settings: ThreadSettings,
+    what: &str,
+) -> anyhow::Result<String> {
+    let before = git(repo, &["branch", "--list", "local-studio/*"])?;
+    let settings =
+        ThreadSettings { worktree: WorktreeChoice::NewWorktree { branch: branch.to_string(), base: None }, ..settings };
+    harness.studio.start_thread(draft.to_string(), Some(project), prompt("ping"), settings);
+    let refusal = refused_start(harness, draft, what)?;
+    let after = git(repo, &["branch", "--list", "local-studio/*"])?;
     ensure!(before == after, "a refused start left branches: before {before:?}, after {after:?}");
-    let worktrees = git(&repo, &["worktree", "list", "--porcelain"])?;
+    let worktrees = git(repo, &["worktree", "list", "--porcelain"])?;
     ensure!(worktrees.matches("worktree ").count() == 1, "a refused start left a worktree:\n{worktrees}");
+    Ok(refusal)
+}
+
+fn worktree_left_alone(harness: &mut Harness) -> anyhow::Result<()> {
+    let (repo, project) = project_repo(harness, "repo", &[])?;
+    let what = "an Eukhe anthropic thread in a new worktree";
+    let refusal = worktree_refused(
+        harness,
+        &repo,
+        project,
+        "worktree-draft",
+        "local-studio/1",
+        on(HAIKU, WorktreeChoice::Local),
+        what,
+    )?;
     println!("ok   a refused worktree start leaves no local-studio/* branch or worktree: {refusal}");
+    Ok(())
+}
+
+/// The global Eukhe default is `anthropic`, but this project's `.eukhe/settings.json` picks the stub, so the
+/// thread's session runs on the stub and must start.
+fn project_default_allowed(harness: &mut Harness) -> anyhow::Result<()> {
+    let (_, project) = project_repo(harness, "stub-project", &[(".eukhe/settings.json", DEFAULT_STUB)])?;
+    println!("     Eukhe's global default is anthropic; the project's .eukhe/settings.json default is {STUB}");
+    let after = harness.view.notices.len();
+    harness.studio.start_thread("stub-draft".to_string(), Some(project), prompt(""), unset(WorktreeChoice::Local));
+    harness.pump_until("a thread on the project's own non-anthropic default is answered", |view| {
+        view.thread("stub-draft").is_some() || view.failure("stub-draft").is_some()
+    })?;
+    if let Some(failure) = harness.view.failure("stub-draft") {
+        bail!("a thread on the project's {STUB} default was refused: {failure}");
+    }
+    ensure!(
+        harness.view.refused_notice(after).is_none(),
+        "a thread on the project's {STUB} default drew the refusal: {:?}",
+        &harness.view.notices[after..]
+    );
+    println!("ok   a thread on the project's {STUB} default starts while the global default is anthropic");
     Ok(())
 }
 
@@ -427,7 +545,85 @@ fn api_key(harness: &mut Harness) -> anyhow::Result<()> {
     let status = view.anthropic().context("anthropic status")?;
     ensure!(status.credential == ProviderCredential::StoredKey && status.configured, "anthropic status {status:?}");
     println!("ok   the Anthropic row is ready with a saved key");
-    existing_thread_refused(harness)
+    harness.studio.start_thread("restart-draft".to_string(), None, prompt(""), on(HAIKU, WorktreeChoice::Local));
+    harness.pump_until("a second anthropic thread starts on the API key with no prompt sent", |view| {
+        view.thread("restart-draft").is_some() || view.failure("restart-draft").is_some()
+    })?;
+    let restarted =
+        harness.view.thread("restart-draft").context("the second API key thread did not start")?.to_string();
+    existing_thread_refused(harness)?;
+    restarted_thread_refused(harness, &restarted)
+}
+
+/// The upgrade case: a thread made on anthropic before the sign-in marker, reopened by a fresh Studio after it,
+/// first with the daemon (and the thread's resident session) kept, then with the daemon stopped too.
+fn restarted_thread_refused(harness: &mut Harness, thread: &str) -> anyhow::Result<()> {
+    let auth = agent_dir()?.join("auth.json");
+    let socket = PathBuf::from(harness.config.socket_path.clone().context("socket")?);
+    for (round, stop) in [("daemon kept", false), ("daemon stopped", true)] {
+        replace_private(&auth, API_KEY)?;
+        println!("     {round}: auth.json holds the fake API key again; thread {thread} is on anthropic");
+        harness.restart(|| {
+            if stop {
+                stop_daemon(&socket)?;
+                daemon_gone(&socket)?;
+            }
+            replace_private(&auth, SIGNED_IN)?;
+            println!("     auth.json now marks anthropic as oauth; a second Studio opens on the same data dir");
+            Ok(())
+        })?;
+        harness.pump_until("the reopened Studio lists the anthropic thread", |view| {
+            view.threads.iter().any(|id| id == thread)
+        })?;
+        let request = format!("restart-send-{stop}");
+        harness.studio.send(request.clone(), thread.to_string(), prompt("ping"), Delivery::Queue);
+        harness
+            .pump_within("a send on the reopened anthropic thread is refused", REFUSAL_TIMEOUT, |view| {
+                view.failure(&request).is_some()
+            })
+            .context("the send after a restart was accepted and went to Eukhe's anthropic model")?;
+        let refusal = harness.view.failure(&request).unwrap_or_default().to_string();
+        ensure!(refusal.contains("Claude Code"), "the send after a restart failed for another reason: {refusal}");
+        println!("ok   {round}: sending on an anthropic thread reopened after a restart is refused: {refusal}");
+    }
+    Ok(())
+}
+
+/// The global Eukhe default is the stub, but this project's `.eukhe/settings.json` picks `anthropic`: a thread
+/// with no provider there must be refused before any prompt reaches its session, locally and in a new worktree.
+fn project_default_refused(harness: &mut Harness) -> anyhow::Result<()> {
+    let default = harness.view.default.clone();
+    println!("     Eukhe's global settings.json default is {default:?}; Local Studio has no default provider");
+    ensure!(
+        default.as_ref().is_some_and(|key| key.provider == STUB),
+        "the global daemon default is not the stub, so the scenario proves nothing: {default:?}"
+    );
+    let (repo, project) = project_repo(harness, "anthropic-project", &[(".eukhe/settings.json", DEFAULT_HAIKU)])?;
+    println!("     the project's .eukhe/settings.json default is anthropic");
+    let text = "ping-project-default";
+    harness.studio.start_thread(
+        "project-draft".to_string(),
+        Some(project.clone()),
+        prompt(text),
+        unset(WorktreeChoice::Local),
+    );
+    let refusal = refused_start(harness, "project-draft", "an Eukhe thread on the project's anthropic default")?;
+    println!("ok   a thread on the project's anthropic default is refused: {refusal}");
+    let what = "an Eukhe thread on the project's anthropic default in a new worktree";
+    let refusal = worktree_refused(
+        harness,
+        &repo,
+        project,
+        "project-worktree",
+        "local-studio/2",
+        unset(WorktreeChoice::Local),
+        what,
+    )?;
+    println!("ok   in a new worktree it is refused, leaving no local-studio/* branch or worktree: {refusal}");
+    let sessions = agent_dir()?.join("sessions");
+    ensure!(!any_file_holds(&sessions, text)?, "the refused prompt reached a session under {}", sessions.display());
+    println!("ok   the refused prompt reached no session");
+    Ok(())
 }
 
 fn existing_thread_refused(harness: &mut Harness) -> anyhow::Result<()> {

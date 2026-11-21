@@ -27,7 +27,7 @@ use crate::model::{
     ModelOption, NoticeLevel, NotificationKind, PromptDraft, Subagent, ThreadInfo, ThreadRow, ThreadSettings,
     TranscriptOp, Update, WorktreeChoice,
 };
-use crate::oneshot::TextGen;
+use crate::oneshot::{resolved_provider, TextGen};
 use crate::plugins::{self, Plugin};
 use crate::session::{self, LiveState};
 use crate::skills::Resources;
@@ -798,6 +798,13 @@ struct Live {
     shown: HashMap<u64, Vec<Block>>,
 }
 
+/// A worktree `create_thread` made, with the branch it created (`None` when the branch already existed).
+struct MadeWorktree {
+    project: PathBuf,
+    path: PathBuf,
+    branch: Option<String>,
+}
+
 #[derive(Default)]
 struct Thread {
     path: Option<String>,
@@ -1235,10 +1242,7 @@ impl Actor {
                 }
             }
             Command::Compact { thread } if self.harness(&thread).is_some() => self.cli_compact(&thread).await,
-            Command::Compact { thread } => match self.ensure_open(&thread).await.and_then(|active| {
-                self.thread_refuses(&thread)?;
-                Ok(active)
-            }) {
+            Command::Compact { thread } => match self.open_unrefused(&thread).await {
                 Ok(active) => {
                     let command = DaemonCommand::Compact {
                         id: None,
@@ -1896,13 +1900,7 @@ impl Actor {
             if self.client.is_none() {
                 return Err("Not connected to the Eukhe daemon yet.".to_string());
             }
-            let chosen = settings.provider.as_deref().or(effective.default_provider.as_deref());
-            let provider = match chosen {
-                Some(provider) => Some(provider.to_string()),
-                None if self.workspace.claude_signed_in() => self.daemon_default().await?.0.map(|key| key.provider),
-                None => None,
-            };
-            self.workspace.eukhe_refuses(provider.as_deref())?;
+            self.workspace.eukhe_refuses(settings.provider.as_deref().or(effective.default_provider.as_deref()))?;
         }
         let choice = match settings.worktree {
             WorktreeChoice::Default => match effective.new_thread_workspace {
@@ -1913,11 +1911,21 @@ impl Actor {
             },
             other => other,
         };
+        let mut made = None;
         let cwd = match (&choice, &project_path) {
             (WorktreeChoice::Existing { path }, _) => path.clone(),
             (WorktreeChoice::NewWorktree { branch, base }, Some(project)) => {
+                let existed = self.workspace.branch_exists(Path::new(project), branch).await;
                 match self.workspace.prepare_worktree(draft, Path::new(project), branch, base.as_deref()).await? {
-                    PreparedWorktree::Worktree(path) => path.to_string_lossy().into_owned(),
+                    PreparedWorktree::Worktree(path) => {
+                        let cwd = path.to_string_lossy().into_owned();
+                        made = Some(MadeWorktree {
+                            project: PathBuf::from(project),
+                            path,
+                            branch: (!existed).then(|| branch.clone()),
+                        });
+                        cwd
+                    }
                     PreparedWorktree::Local => project.clone(),
                 }
             }
@@ -1965,9 +1973,63 @@ impl Actor {
                 self.mailbox.notice(NoticeLevel::Warning, error);
             }
         }
+        self.refuse_new(draft, &id, &created.active_session_id, &created.session_file, made).await?;
         self.mailbox.push(Update::ThreadStarted { draft: draft.to_string(), thread: id.clone() });
         self.dirty = true;
         Ok(id)
+    }
+
+    /// While the Claude sign-in holds, reads the model a new thread's session actually runs on (its real cwd's
+    /// settings and any model just applied) and, when it is `anthropic`, undoes the thread before any prompt.
+    async fn refuse_new(
+        &mut self,
+        draft: &str,
+        id: &str,
+        created: &str,
+        file: &str,
+        made: Option<MadeWorktree>,
+    ) -> Result<(), String> {
+        if !self.workspace.claude_signed_in() {
+            return Ok(());
+        }
+        let active = self.live_active(id).unwrap_or_else(|| created.to_string());
+        let refused = match self.session_provider(&active).await {
+            Ok(provider) => self.workspace.eukhe_refuses(provider.as_deref()),
+            Err(error) => Err(error),
+        };
+        if let Err(refused) = refused {
+            self.abandon_thread(draft, id, &active, file, made).await;
+            return Err(refused);
+        }
+        Ok(())
+    }
+
+    /// Undoes a thread `create_thread` made but will not start: its session, its saved file, its rows, and the
+    /// worktree and branch made for it, so a refused start leaves nothing behind.
+    async fn abandon_thread(&mut self, draft: &str, id: &str, active: &str, file: &str, made: Option<MadeWorktree>) {
+        let _ = self
+            .call(DaemonCommand::Kill { id: None, active_session_id: active.to_string(), rest: Map::default() })
+            .await;
+        let delete = DaemonCommand::DeleteSavedSession {
+            id: None,
+            active_session_id: None,
+            session_path: file.to_string(),
+            rest: Map::default(),
+        };
+        let _ = self.call(delete).await;
+        if let Some(thread) = self.threads.remove(id) {
+            if let Some(live) = thread.live {
+                self.by_active.remove(&live.active);
+            }
+        }
+        self.saved.remove(id);
+        self.roster.retain(|_, row| row.session_id != id);
+        self.store.threads.remove(id);
+        self.save();
+        if let Some(made) = made {
+            self.workspace.discard_worktree(draft, &made.project, &made.path, made.branch.as_deref()).await;
+        }
+        self.dirty = true;
     }
 
     async fn start_threads(
@@ -2017,7 +2079,7 @@ impl Actor {
         let active = self.ensure_open(id).await?;
         let cli = self.harness(id).is_some();
         if !cli {
-            self.thread_refuses(id)?;
+            self.thread_refuses(id, &active).await?;
         }
         let message = if !cli && (message.starts_with('/') || message.contains('$')) {
             self.resources(id, &active).await.expand(&message)
@@ -2089,15 +2151,36 @@ impl Actor {
         Ok(())
     }
 
-    /// Refuses a model call on an Eukhe thread whose current model is `anthropic` on the Claude sign-in.
-    fn thread_refuses(&self, id: &str) -> Result<(), String> {
-        let provider = self
+    /// Refuses a model call on the Eukhe thread `id` (open as `active`) whose model is `anthropic` on the Claude
+    /// sign-in. While the sign-in holds, a model this core has not seen yet is read from the session, so a thread
+    /// reopened before its state arrives fails closed.
+    async fn thread_refuses(&self, id: &str, active: &str) -> Result<(), String> {
+        if !self.workspace.claude_signed_in() {
+            return Ok(());
+        }
+        let seen = self
             .threads
             .get(id)
             .and_then(|thread| thread.live.as_ref())
             .and_then(|live| live.state.model.as_ref())
-            .map(|model| model.provider.as_str());
-        self.workspace.eukhe_refuses(provider)
+            .map(|model| model.provider.clone())
+            .filter(|provider| !provider.is_empty());
+        let provider = match seen {
+            Some(provider) => Some(provider),
+            None => self.session_provider(active).await?,
+        };
+        self.workspace.eukhe_refuses(provider.as_deref())
+    }
+
+    async fn session_provider(&self, active: &str) -> Result<Option<String>, String> {
+        let client = self.client.clone().ok_or_else(|| "Not connected to the Eukhe daemon yet.".to_string())?;
+        resolved_provider(&client, active).await
+    }
+
+    async fn open_unrefused(&mut self, id: &str) -> Result<String, String> {
+        let active = self.ensure_open(id).await?;
+        self.thread_refuses(id, &active).await?;
+        Ok(active)
     }
 
     fn thread_project(&self, id: &str) -> Option<String> {
@@ -2182,7 +2265,7 @@ impl Actor {
         };
         let active = live.active.clone();
         let next_steering = format!("steering:{}", live.state.queue.steering.len());
-        if let Err(refused) = self.thread_refuses(id) {
+        if let Err(refused) = self.thread_refuses(id, &active).await {
             self.mailbox.notice(NoticeLevel::Error, refused);
             return;
         }
@@ -2440,8 +2523,7 @@ impl Actor {
         if let Some(harness) = self.harness(id) {
             return Err(cli::unsupported(harness, "fork"));
         }
-        let active = self.ensure_open(id).await?;
-        self.thread_refuses(id)?;
+        let active = self.open_unrefused(id).await?;
         let tree = self
             .call(DaemonCommand::GetSessionTree { id: None, active_session_id: active.clone(), rest: Map::default() })
             .await?;
@@ -3481,7 +3563,7 @@ impl Actor {
             ));
         }
         let active = self.ensure_open(id).await?;
-        if let Err(refused) = self.thread_refuses(id) {
+        if let Err(refused) = self.thread_refuses(id, &active).await {
             self.release(id).await;
             return Err(refused);
         }
