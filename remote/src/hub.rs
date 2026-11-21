@@ -237,6 +237,7 @@ struct Mirror {
     items: Option<Vec<Item>>,
     info: Option<Arc<str>>,
     approvals: Option<Arc<str>>,
+    questions: Vec<(String, Arc<str>)>,
     queue: Option<Arc<str>>,
     subagents: Option<Arc<str>>,
     setup: Option<Arc<str>>,
@@ -348,9 +349,9 @@ impl State {
         if let Some(items) = &mirror.items {
             texts.push(windowed_reset(thread, items));
         }
-        texts.extend(
-            [&mirror.approvals, &mirror.queue, &mirror.subagents, &mirror.setup].into_iter().flatten().cloned(),
-        );
+        texts.extend(mirror.approvals.iter().cloned());
+        texts.extend(mirror.questions.iter().map(|(_, text)| Arc::clone(text)));
+        texts.extend([&mirror.queue, &mirror.subagents, &mirror.setup].into_iter().flatten().cloned());
         for text in texts {
             self.deliver(device, text, None);
         }
@@ -839,6 +840,19 @@ impl Hub {
                 value["thread"] = Value::String(thread.clone());
                 state.local_setup(&thread, done, &value);
             }
+            Update::Questions { thread, request, .. } => {
+                let text = text_of(&value);
+                let Some(mirror) = state.mirrors.get_mut(&thread) else { return };
+                mirror.questions.retain(|(known, _)| *known != request);
+                mirror.questions.push((request, Arc::clone(&text)));
+                state.send_watchers(&thread, &text);
+            }
+            Update::QuestionsSettled { thread, request } => {
+                let text = text_of(&value);
+                let Some(mirror) = state.mirrors.get_mut(&thread) else { return };
+                mirror.questions.retain(|(known, _)| *known != request);
+                state.send_watchers(&thread, &text);
+            }
             Update::Notification { thread, kind: notification, .. } => {
                 state.broadcast(&text_of(&value));
                 drop(state);
@@ -1236,7 +1250,11 @@ impl Hub {
 
     fn admit(&self, state: &mut State, device: &str, conn: ConnId, op: &str, answered: bool) -> Result<(), OpError> {
         let prompt_op = ops::idempotent(op);
-        let room = if matches!(op, "abort" | "answer_approval") { MAX_COMMANDS + MAX_CONTROL } else { MAX_COMMANDS };
+        let room = if matches!(op, "abort" | "answer_approval" | "answer_questions") {
+            MAX_COMMANDS + MAX_CONTROL
+        } else {
+            MAX_COMMANDS
+        };
         if self.studio.queued() >= room {
             return Err(OpError::new(
                 "busy",

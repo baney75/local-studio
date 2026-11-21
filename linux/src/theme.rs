@@ -59,6 +59,7 @@ window, dialog { font-size: 13px; }
 .ls-placeholder { color: alpha(currentColor, 0.4); font-size: 14px; }
 .ls-approval { border-bottom: 1px solid var(--border-color); padding: 4px 6px 10px 6px; margin-bottom: 6px; }
 .ls-approval .kind { color: #f5a524; font-weight: 600; font-size: 12px; }
+.ls-question .kind, .ls-question-icon { color: var(--accent-color); }
 .ls-approval .command { font-family: monospace; font-size: 12px; background: alpha(currentColor, 0.05); border-radius: 6px; padding: 6px 8px; }
 .ls-working { font-size: 12px; color: alpha(currentColor, 0.55); }
 .ls-hero { font-size: 22px; font-weight: 600; }

@@ -157,6 +157,26 @@ extension SnapshotCatalog {
                 view: thread
             ),
             SnapshotEntry(
+                name: "conversation-question",
+                size: CGSize(width: 980, height: 720),
+                focus: "t1",
+                updates: [
+                    .thread(thread: "t1", info: fixtures.info(busy: true)),
+                    .transcript(thread: "t1", op: .reset(items: fixtures.approvalTurn)),
+                    .questions(thread: "t1", request: "q1", source: "plugin:taxes", questions: [
+                        Question(
+                            header: "taxes", question: "Is the W-2 box 1 wage $50,000.00?",
+                            options: [
+                                QuestionOption(label: "Yes", description: ""),
+                                QuestionOption(label: "No", description: ""),
+                            ],
+                            multiSelect: false
+                        ),
+                    ]),
+                ],
+                view: thread
+            ),
+            SnapshotEntry(
                 name: "conversation-errors",
                 size: CGSize(width: 980, height: 700),
                 focus: "t1",

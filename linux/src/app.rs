@@ -462,6 +462,16 @@ impl App {
                     dirty.composer = true;
                 }
             }
+            Update::Questions { thread, request, source: _, questions } => {
+                let mut state = self.state.borrow_mut();
+                dirty.composer |= state.selected.as_deref() == Some(thread.as_str());
+                crate::question::set(&mut state.questions, thread, request, questions);
+            }
+            Update::QuestionsSettled { thread, request } => {
+                let mut state = self.state.borrow_mut();
+                dirty.composer |= state.selected.as_deref() == Some(thread.as_str());
+                crate::question::settle(&mut state.questions, &thread, &request);
+            }
             Update::Queue { thread, queued } => {
                 let mut state = self.state.borrow_mut();
                 if state.selected.as_deref() == Some(thread.as_str()) {
@@ -1105,7 +1115,9 @@ impl App {
             let notification = gio::Notification::new(title);
             notification.set_body(Some(body));
             notification.set_priority(match kind {
-                NotificationKind::NeedsApproval | NotificationKind::Failed => gio::NotificationPriority::High,
+                NotificationKind::NeedsApproval | NotificationKind::NeedsAnswer | NotificationKind::Failed => {
+                    gio::NotificationPriority::High
+                }
                 NotificationKind::TurnDone => gio::NotificationPriority::Normal,
             });
             notification.set_default_action_and_target_value("app.open-thread", Some(&thread.to_variant()));
@@ -1114,7 +1126,9 @@ impl App {
         if matches!(mode, NotificationMode::Sound | NotificationMode::NotificationsAndSound) {
             crate::sound::play(match kind {
                 NotificationKind::TurnDone => crate::sound::Sound::Completion,
-                NotificationKind::NeedsApproval | NotificationKind::Failed => crate::sound::Sound::Input,
+                NotificationKind::NeedsApproval | NotificationKind::NeedsAnswer | NotificationKind::Failed => {
+                    crate::sound::Sound::Input
+                }
             });
         }
     }

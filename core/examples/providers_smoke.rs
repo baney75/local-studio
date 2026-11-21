@@ -254,6 +254,8 @@ impl Harness {
             Update::ArchivedThreads { .. }
             | Update::ThreadSearch { .. }
             | Update::Approvals { .. }
+            | Update::Questions { .. }
+            | Update::QuestionsSettled { .. }
             | Update::Queue { .. }
             | Update::ComposerText { .. }
             | Update::Commands { .. }

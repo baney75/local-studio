@@ -25,7 +25,7 @@ pub fn arg<T: DeserializeOwned>(args: &Value, key: &str) -> Result<T, OpError> {
 pub fn correlation(op: &str) -> Option<&'static str> {
     match op {
         "start_thread" => Some("draft"),
-        "answer_approval" => None,
+        "answer_approval" | "answer_questions" => None,
         _ => Some("request"),
     }
 }
@@ -64,12 +64,7 @@ pub fn dispatch(
         "send_queued_now" => studio.send_queued_now(arg(a, "thread")?, arg(a, "queued")?),
         "remove_queued" => studio.remove_queued(arg(a, "thread")?, arg(a, "queued")?),
         "answer_approval" => studio.answer_approval(arg(a, "thread")?, arg(a, "request")?, arg(a, "answer")?),
-        "answer_questions" => {
-            return Err(OpError::new(
-                "not_built",
-                "answer_questions waits on question cards in Eukhe's daemon (issue #19); this server has no questions to answer",
-            ));
-        }
+        "answer_questions" => studio.answer_questions(arg(a, "thread")?, arg(a, "request")?, arg(a, "answers")?),
         "compact" => studio.compact(arg(a, "thread")?),
         "start_thread" => {
             let (draft, project, settings) = (arg(a, "draft")?, arg(a, "project")?, arg(a, "settings")?);

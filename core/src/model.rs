@@ -183,6 +183,7 @@ pub struct SlashCommand {
 pub enum NotificationKind {
     TurnDone,
     NeedsApproval,
+    NeedsAnswer,
     Failed,
 }
 
@@ -457,6 +458,24 @@ pub struct Approval {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "camelCase"))]
 #[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct Question {
+    pub header: String,
+    pub question: String,
+    pub options: Vec<QuestionOption>,
+    pub multi_select: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "camelCase"))]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "camelCase"))]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
 pub struct ModelOption {
     pub provider: String,
     pub id: String,
@@ -575,6 +594,16 @@ pub enum Update {
     Approvals {
         thread: String,
         approvals: Vec<Approval>,
+    },
+    Questions {
+        thread: String,
+        request: String,
+        source: String,
+        questions: Vec<Question>,
+    },
+    QuestionsSettled {
+        thread: String,
+        request: String,
     },
     Queue {
         thread: String,

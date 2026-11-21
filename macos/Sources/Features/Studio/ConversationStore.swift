@@ -20,6 +20,7 @@ final class ConversationStore {
     private(set) var rows: [TimelineRow] = []
     private(set) var anchors: [TimelineAnchor] = []
     private(set) var approvals: [Approval] = []
+    private(set) var pluginQuestions: [String: [PluginQuestion]] = [:]
     private(set) var queued: [QueuedMessage] = []
     private(set) var models: [ModelOption] = []
     private(set) var favorites: [ModelKey] = []
@@ -489,6 +490,35 @@ final class ConversationStore {
     func setApprovals(thread: String, approvals: [Approval]) {
         guard thread == self.thread, self.approvals != approvals else { return }
         self.approvals = approvals
+    }
+
+    var questions: [PluginQuestion] {
+        thread.flatMap { pluginQuestions[$0] } ?? []
+    }
+
+    func setQuestions(thread: String, request: String, source: String, questions: [Question]) {
+        guard let question = questions.first else { return }
+        let pending = PluginQuestion(request: request, source: source, question: question)
+        var list = pluginQuestions[thread] ?? []
+        if let index = list.firstIndex(where: { $0.request == request }) {
+            guard list[index] != pending else { return }
+            list[index] = pending
+        } else {
+            list.append(pending)
+        }
+        pluginQuestions[thread] = list
+    }
+
+    func settleQuestion(thread: String, request: String) {
+        guard var list = pluginQuestions[thread], list.contains(where: { $0.request == request }) else { return }
+        list.removeAll { $0.request == request }
+        pluginQuestions[thread] = list.isEmpty ? nil : list
+    }
+
+    func answer(_ question: PluginQuestion, with answer: String) {
+        let answer = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let thread, !answer.isEmpty else { return }
+        core.run { $0.answerQuestions(thread: thread, request: question.request, answers: [question.question.question: answer]) }
     }
 
     func setQueue(thread: String, queued: [QueuedMessage]) {
@@ -1050,6 +1080,14 @@ struct OutgoingMessage: Identifiable {
 
     var text: String { shape.text }
     var queued: Bool { shape.queued }
+}
+
+struct PluginQuestion: Equatable, Identifiable {
+    let request: String
+    let source: String
+    let question: Question
+
+    var id: String { request }
 }
 
 private struct CachedTranscript {

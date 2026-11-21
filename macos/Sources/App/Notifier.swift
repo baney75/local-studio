@@ -46,7 +46,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     }
 
     private func play(_ kind: NotificationKind) {
-        let name = kind == .needsApproval ? "notification-input" : "notification-completion"
+        let name = kind == .needsApproval || kind == .needsAnswer ? "notification-input" : "notification-completion"
         guard let url = Bundle.main.url(forResource: name, withExtension: "mp3") else {
             NSSound(named: kind == .turnDone ? "Glass" : "Ping")?.play()
             return
@@ -98,6 +98,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         switch kind {
         case .turnDone: return "\(name) finished"
         case .needsApproval: return "\(name) needs approval"
+        case .needsAnswer: return "\(name) has a question"
         case .failed: return "\(name) failed"
         }
     }

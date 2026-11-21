@@ -1502,7 +1502,7 @@ async fn op_checks(run: &mut Run, a: &mut Client) -> anyhow::Result<()> {
     a.refused("add_project", json!({ "path": "/tmp" }), "not_remote").await?;
     a.refused("load_usage", json!({ "request": "u", "period": "day" }), "not_remote").await?;
     a.refused("delete_thread", json!({ "thread": "x" }), "not_remote").await?;
-    a.refused("answer_questions", json!({ "thread": "x", "request": "q", "answers": {} }), "not_built").await?;
+    a.refused("answer_questions", json!({ "thread": "x", "request": "q", "answers": "yes" }), "bad_args").await?;
     a.refused("rename_thread", json!({ "thread": 7 }), "bad_args").await?;
     a.refused("hello", json!({}), "bad_state").await?;
     a.refused("load_earlier", json!({ "thread": "nope" }), "not_watched").await?;

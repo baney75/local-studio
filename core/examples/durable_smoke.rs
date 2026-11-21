@@ -110,6 +110,8 @@ impl Harness {
             | Update::ThreadSearch { .. }
             | Update::Thread { .. }
             | Update::Approvals { .. }
+            | Update::Questions { .. }
+            | Update::QuestionsSettled { .. }
             | Update::Queue { .. }
             | Update::ComposerText { .. }
             | Update::Models { .. }

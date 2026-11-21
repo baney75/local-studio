@@ -60,6 +60,7 @@ const PROBE_TIMEOUT_MS: u64 = 5_000;
 const KILL_TIMEOUT_MS: u64 = 15_000;
 const DELIVERY_SLACK_MS: i64 = 2_000;
 
+mod ask;
 mod cli;
 mod remote;
 
@@ -333,6 +334,21 @@ enum Command {
         request: String,
         answer: ApprovalAnswer,
     },
+    AnswerQuestions {
+        thread: String,
+        request: String,
+        answers: HashMap<String, String>,
+    },
+    PluginAsk {
+        ask: plugins::ask::Ask,
+    },
+    PluginAskGone {
+        thread: String,
+        request: String,
+    },
+    FlushAskNotes {
+        thread: String,
+    },
     RenameThread {
         thread: String,
         title: String,
@@ -591,6 +607,8 @@ impl Studio {
         let links = crate::link::client::Links::new(runtime.handle().clone(), Arc::clone(&mailbox), &data_dir);
         #[cfg(feature = "link")]
         let link_dir = data_dir.clone();
+        let ask_tokens = plugins::ask::Tokens::default();
+        let ask_socket = start_ask_server(&runtime, &data_dir, &ask_tokens, &inbox, &mailbox);
         let actor = Actor {
             socket,
             session_dir,
@@ -636,6 +654,11 @@ impl Studio {
             generation: 0,
             codex_models: Vec::new(),
             plugin_consent: Vec::new(),
+            ask_socket,
+            ask_tokens,
+            questions: HashMap::new(),
+            ask_notes: HashMap::new(),
+            ask_sent: HashMap::new(),
         };
         runtime.spawn(actor.run(receiver, cli_events));
         Ok(Arc::new(Self {
@@ -740,6 +763,10 @@ impl Studio {
 
     pub fn answer_approval(&self, thread: String, request: String, answer: ApprovalAnswer) {
         self.send_command(Command::AnswerApproval { thread, request, answer });
+    }
+
+    pub fn answer_questions(&self, thread: String, request: String, answers: HashMap<String, String>) {
+        self.send_command(Command::AnswerQuestions { thread, request, answers });
     }
 
     pub fn rename_thread(&self, thread: String, title: String) {
@@ -1089,6 +1116,49 @@ struct Actor {
     generation: u64,
     codex_models: Vec<ModelOption>,
     plugin_consent: Vec<String>,
+    ask_socket: Option<PathBuf>,
+    ask_tokens: plugins::ask::Tokens,
+    questions: HashMap<String, Vec<ask::Pending>>,
+    ask_notes: HashMap<String, Vec<String>>,
+    ask_sent: HashMap<String, Value>,
+}
+
+#[cfg(unix)]
+fn start_ask_server(
+    runtime: &tokio::runtime::Runtime,
+    data_dir: &Path,
+    tokens: &plugins::ask::Tokens,
+    inbox: &Inbox,
+    mailbox: &Mailbox,
+) -> Option<PathBuf> {
+    let path = plugins::ask::socket_path(data_dir);
+    let asker = inbox.clone();
+    let events: Arc<dyn Fn(plugins::ask::Event) + Send + Sync> = Arc::new(move |event| match event {
+        plugins::ask::Event::Ask(ask) => asker.send(Command::PluginAsk { ask }),
+        plugins::ask::Event::Gone { thread, request } => asker.send(Command::PluginAskGone { thread, request }),
+    });
+    let _entered = runtime.enter();
+    match plugins::ask::serve(&path, tokens.clone(), events) {
+        Ok(_) => Some(path),
+        Err(error) => {
+            mailbox.notice(
+                NoticeLevel::Warning,
+                format!("Plugins cannot ask you questions: could not listen on {}: {error}", path.display()),
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn start_ask_server(
+    _runtime: &tokio::runtime::Runtime,
+    _data_dir: &Path,
+    _tokens: &plugins::ask::Tokens,
+    _inbox: &Inbox,
+    _mailbox: &Mailbox,
+) -> Option<PathBuf> {
+    None
 }
 
 struct DaemonFacts {
@@ -1308,6 +1378,12 @@ impl Actor {
             }
             client.close();
         }
+        for id in self.questions.keys().cloned().collect::<Vec<_>>() {
+            self.cancel_questions(&id, false);
+        }
+        if let Some(socket) = self.ask_socket.take() {
+            let _ = std::fs::remove_file(socket);
+        }
         if done.send(()).is_err() {
             self.mailbox.notice(NoticeLevel::Warning, "The core stopped after its caller stopped waiting.");
         }
@@ -1426,13 +1502,31 @@ impl Actor {
                     self.mailbox.push(Update::RequestFailed { request, message });
                 }
             }
-            Command::Abort { thread } => self.stop_run(&thread).await,
+            Command::Abort { thread } => {
+                self.cancel_questions(&thread, true);
+                self.stop_run(&thread).await;
+            }
             Command::SendQueuedNow { thread, queued } => self.send_queued_now(&thread, &queued).await,
             Command::RemoveQueued { thread, queued } => self.remove_queued(&thread, &queued).await,
             Command::AnswerApproval { thread, request, answer } => self.answer(&thread, request, answer).await,
+            Command::AnswerQuestions { thread, request, answers } => {
+                self.answer_questions(&thread, &request, answers).await;
+            }
+            Command::PluginAsk { ask } => self.plugin_ask(ask),
+            Command::PluginAskGone { thread, request } => self.question_gone(&thread, &request),
+            Command::FlushAskNotes { thread } => {
+                if !self.running(&thread) {
+                    self.flush_ask_notes(&thread).await;
+                }
+            }
             Command::RenameThread { thread, title } => self.rename(&thread, &title).await,
             Command::DeleteThread { thread } => self.delete(&thread).await,
-            Command::SetArchived { thread, archived } => self.flag(&thread, |flags, _| flags.archived = archived),
+            Command::SetArchived { thread, archived } => {
+                if archived {
+                    self.cancel_questions(&thread, true);
+                }
+                self.flag(&thread, |flags, _| flags.archived = archived);
+            }
             Command::SetPinned { thread, pinned } => {
                 self.flag(&thread, |flags, now| flags.pin_order = pinned.then_some(now));
             }
@@ -1788,6 +1882,7 @@ impl Actor {
             op: crate::model::TranscriptOp::Reset { items: live.transcript.items().to_vec() },
         });
         self.emit_approvals(id);
+        self.emit_questions(id);
         self.emit_queue(id);
     }
 
@@ -1922,6 +2017,7 @@ impl Actor {
     }
 
     async fn attach(&mut self, id: &str, active: &str) -> Result<(), String> {
+        self.ask_sent.remove(active);
         let client = self.client.clone().ok_or_else(|| "Not connected to the Eukhe daemon yet.".to_string())?;
         let data = saved_sessions::attach(&client, active, DaemonClientKind::Interactive)
             .await
@@ -2030,6 +2126,7 @@ impl Actor {
             || thread.pending_run
             || live.state.queue.len() > 0
             || !live.approvals.is_empty()
+            || self.has_questions(id)
             || self.titles.values().any(|title| title == id)
         {
             return;
@@ -2302,6 +2399,10 @@ impl Actor {
             let steer = matches!(delivery, Delivery::Steer);
             self.cli_send(id, &message, Self::cli_images(&prompt), steer, request)
         } else {
+            if !self.threads.get(id).and_then(|thread| thread.live.as_ref()).is_some_and(|live| live.state.busy) {
+                self.flush_ask_notes(id).await;
+                self.sync_ask_servers(id, &active).await;
+            }
             let command = DaemonCommand::Prompt {
                 id: None,
                 active_session_id: active,
@@ -2584,6 +2685,7 @@ impl Actor {
             self.cli_delete(id);
             return;
         }
+        self.forget_ask_thread(id);
         let Some(path) = self.session_path(id) else {
             self.mailbox.notice(NoticeLevel::Error, format!("The session file of thread {id} is unknown."));
             return;
@@ -3593,6 +3695,9 @@ impl Actor {
             (NotificationKind::TurnDone, truncate(&answer, BODY_LIMIT))
         };
         self.mailbox.push(Update::Notification { thread: id.to_string(), kind, title, body });
+        if self.ask_notes.contains_key(id) {
+            self.itself.send(Command::FlushAskNotes { thread: id.to_string() });
+        }
         self.dirty = true;
     }
 
@@ -3920,7 +4025,11 @@ impl Actor {
                 || thread.is_some_and(|thread| thread.pending_run)
                 || roster.is_some_and(|row| row.running),
             run_started_at: thread.and_then(|thread| thread.run_started_at),
-            approval_since: live.and_then(|live| live.approvals.iter().map(|(_, at)| *at).min()),
+            approval_since: live
+                .and_then(|live| live.approvals.iter().map(|(_, at)| *at).min())
+                .into_iter()
+                .chain(self.question_since(id))
+                .min(),
             failed_at: thread
                 .and_then(|thread| thread.failed_at)
                 .or_else(|| roster.filter(|row| row.failed).map(|row| row.updated_at.unwrap_or(now))),

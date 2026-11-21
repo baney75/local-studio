@@ -286,6 +286,8 @@ impl Harness {
             Update::Thread { .. }
             | Update::Transcript { .. }
             | Update::Approvals { .. }
+            | Update::Questions { .. }
+            | Update::QuestionsSettled { .. }
             | Update::Queue { .. }
             | Update::ComposerText { .. }
             | Update::Models { .. }

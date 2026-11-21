@@ -177,6 +177,7 @@ private struct ConversationColumn: View {
                         }
                     }
                     ApprovalCard(store: store)
+                    QuestionCard(store: store)
                     ComposerView(store: store)
                         .focusRegionFrame(.composer, in: store.shell)
                     ThreadContextStrip(store: store)
@@ -589,7 +590,7 @@ private struct TimelineFooter: View {
         VStack(alignment: .leading, spacing: 14) {
             if live {
                 if let info = conversation.info, info.busy {
-                    WorkingRow(info: info, waitingForApproval: !conversation.approvals.isEmpty, probe: store.shell.probe)
+                    WorkingRow(info: info, waitingForApproval: !conversation.approvals.isEmpty || !conversation.questions.isEmpty, probe: store.shell.probe)
                 }
                 ForEach(conversation.queued, id: \.id) { message in
                     QueuedBubble(message: message, store: store)

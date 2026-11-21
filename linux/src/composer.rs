@@ -25,6 +25,7 @@ pub struct Composer {
     approval_command: gtk::Label,
     approval_effects: gtk::Label,
     approval_request: RefCell<Option<String>>,
+    pub question: crate::question::QuestionCard,
     view: gtk::TextView,
     placeholder: gtk::Label,
     model: gtk::DropDown,
@@ -144,6 +145,7 @@ impl Composer {
         let extras = Extras::new(app.clone());
         let tools = crate::tools::Tools::new(&app);
         let setup = crate::setup::SetupCard::new(&app);
+        let question = crate::question::QuestionCard::new(&app);
         let options = crate::options::Options::new(&app);
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         footer.append(&extras.attach);
@@ -165,6 +167,7 @@ impl Composer {
         card.add_css_class("ls-composer");
         card.append(&extras.menu);
         card.append(&approval);
+        card.append(&question.root);
         card.append(&extras.chips);
         card.append(&overlay);
         card.append(&footer);
@@ -330,6 +333,7 @@ impl Composer {
             approval_command,
             approval_effects,
             approval_request: RefCell::new(None),
+            question,
             view,
             placeholder,
             model,
@@ -487,6 +491,7 @@ impl Composer {
             self.queue.append(&sending_row(text));
         }
 
+        self.question.render(state);
         let approval = state.approvals.first();
         self.approval.set_visible(approval.is_some());
         self.approval_request.replace(approval.map(|approval| approval.request_id.clone()));

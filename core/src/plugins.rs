@@ -6,6 +6,7 @@ use serde_json::{json, Map, Value};
 
 use crate::model::{CommandKind, SlashCommand};
 
+pub mod ask;
 mod grants;
 mod install;
 #[cfg(all(test, unix))]

@@ -195,6 +195,8 @@ impl Harness {
             Update::MessageImage { data, .. } => self.view.image = Some(data),
             Update::Usage { report, .. } => self.view.usage = Some(report),
             Update::Thread { .. }
+            | Update::Questions { .. }
+            | Update::QuestionsSettled { .. }
             | Update::Subagents { .. }
             | Update::GitStatus { .. }
             | Update::Branches { .. }

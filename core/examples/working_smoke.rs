@@ -148,6 +148,8 @@ fn apply(watch: &mut Watch, update: Update) {
         }
         Update::Notice { level, text } => println!("     notice {level:?}: {text}"),
         Update::Approvals { .. }
+        | Update::Questions { .. }
+        | Update::QuestionsSettled { .. }
         | Update::ArchivedThreads { .. }
         | Update::ThreadSearch { .. }
         | Update::Transcript { .. }

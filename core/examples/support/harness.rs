@@ -185,6 +185,8 @@ fn apply(watch: &mut Watch, update: Update) {
         Update::Transcript { .. }
         | Update::Thread { .. }
         | Update::Approvals { .. }
+        | Update::Questions { .. }
+        | Update::QuestionsSettled { .. }
         | Update::ArchivedThreads { .. }
         | Update::ThreadSearch { .. }
         | Update::Queue { .. }
