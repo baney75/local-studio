@@ -31,6 +31,7 @@ struct Grant {
 pub enum Consent {
     Ready,
     NeedsConsent { missing: Vec<Capability> },
+    Refused { reason: String },
 }
 
 impl Grants {
@@ -45,17 +46,20 @@ impl Grants {
         crate::workspace::providers::write_private(&root.join(GRANTS), &value)
     }
 
-    fn current(&self, plugin: &Plugin) -> Option<&Grant> {
-        let grant = self.plugins.get(&plugin.id).filter(|grant| !grant.tree.is_empty())?;
-        (live_hash(&plugin.dir).ok()? == grant.tree).then_some(grant)
-    }
-
     #[must_use]
     pub fn consent(&self, plugin: &Plugin) -> Consent {
         if plugin.capabilities.is_empty() {
             return Consent::Ready;
         }
-        let granted = self.current(plugin).map(|grant| &grant.capabilities);
+        let tree = match live_hash(&plugin.dir) {
+            Ok(tree) => tree,
+            Err(reason) => return Consent::Refused { reason },
+        };
+        let granted = self
+            .plugins
+            .get(&plugin.id)
+            .filter(|grant| !grant.tree.is_empty() && grant.tree == tree)
+            .map(|grant| &grant.capabilities);
         let missing: Vec<Capability> = plugin
             .capabilities
             .iter()
@@ -126,7 +130,7 @@ impl Grants {
         // A slice 2 record has no tree: keep its source (empty, unknown origin) rather than invent one.
         let source = match record.filter(|grant| grant.tree == tree || grant.tree.is_empty()) {
             Some(grant) => grant.source.clone(),
-            None => format!("folder {}", plugin.dir.display()),
+            None => format!("folder {}", super::absolute(&plugin.dir).display()),
         };
         let kept: BTreeSet<String> = current
             .map(|grant| grant.capabilities.clone())

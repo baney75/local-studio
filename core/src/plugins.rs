@@ -309,8 +309,15 @@ fn mcp_in(dir: &Path, id: &str, mcp: ManifestMcp, errors: &mut Vec<String>) -> O
         }
     };
     let before = errors.len();
-    let unhashed = |path: &str| Path::new(path).components().any(|part| part.as_os_str() == install::UNHASHED);
-    if unhashed(&mcp.command) || mcp.args.iter().any(|arg| unhashed(arg)) {
+    let names = |path: &Path| path.components().any(|part| install::named(part.as_os_str(), install::UNHASHED));
+    let base = std::fs::canonicalize(dir).ok();
+    let unhashed = std::iter::once(&mcp.command).chain(&mcp.args).flat_map(|path| path.split('=')).any(|part| {
+        names(Path::new(part))
+            || base.as_ref().is_some_and(|base| {
+                std::fs::canonicalize(dir.join(part)).is_ok_and(|real| real.strip_prefix(base).is_ok_and(&names))
+            })
+    });
+    if unhashed {
         errors.push(format!("[mcp] runs a {} file, which no hash covers", install::UNHASHED));
     }
     let prefix = env_prefix(id);
@@ -336,10 +343,15 @@ fn valid_env_name(name: &str) -> bool {
 }
 
 #[must_use]
-pub fn mcp_servers(plugins: &[Plugin], grants: &Grants) -> Map<String, Value> {
-    plugins
+pub fn ready<'a>(plugins: &'a [Plugin], grants: &Grants) -> Vec<(&'a Plugin, Consent)> {
+    plugins.iter().map(|plugin| (plugin, grants.consent(plugin))).collect()
+}
+
+fn mcp_servers(ready: &[(&Plugin, Consent)]) -> Map<String, Value> {
+    ready
         .iter()
-        .filter(|plugin| grants.consent(plugin) == Consent::Ready && plugin.asks(Capability::McpServer))
+        .filter(|(plugin, consent)| *consent == Consent::Ready && plugin.asks(Capability::McpServer))
+        .map(|(plugin, _)| *plugin)
         .filter_map(|plugin| {
             let mcp = plugin.mcp.as_ref()?;
             let dir = absolute(&plugin.dir);
@@ -360,18 +372,16 @@ pub fn mcp_servers(plugins: &[Plugin], grants: &Grants) -> Map<String, Value> {
 }
 
 fn written_by_us(root: &Path, name: &str, entry: &Value) -> bool {
-    match entry.get(MCP_TAG) {
-        Some(tag) => tag == &Value::Bool(true),
-        None => {
-            name.starts_with(MCP_PREFIX)
-                && ["command", "cwd"].iter().any(|key| {
-                    entry.get(*key).and_then(Value::as_str).is_some_and(|path| Path::new(path).starts_with(root))
-                })
+    name.starts_with(MCP_PREFIX)
+        && match entry.get(MCP_TAG) {
+            Some(tag) => tag == &Value::Bool(true),
+            None => entry.get("command").and_then(Value::as_str).map(Path::new).is_some_and(|command| {
+                command.starts_with(root) && !command.components().any(|part| part == std::path::Component::ParentDir)
+            }),
         }
-    }
 }
 
-pub fn sync_mcp_servers(root: &Path, agent: &Path, plugins: &[Plugin], grants: &Grants) -> Result<bool, String> {
+pub fn sync_mcp_servers(root: &Path, agent: &Path, ready: &[(&Plugin, Consent)]) -> Result<bool, String> {
     let path = agent.join("settings.json");
     let mut settings = crate::workspace::providers::read_object(&path)?;
     let mut servers = match settings.remove("mcpServers") {
@@ -381,9 +391,8 @@ pub fn sync_mcp_servers(root: &Path, agent: &Path, plugins: &[Plugin], grants: &
     };
     let root = absolute(root);
     let ours = |name: &str, entry: &Value| written_by_us(&root, name, entry);
-    let (wanted, taken): (Map<String, Value>, Map<String, Value>) = mcp_servers(plugins, grants)
-        .into_iter()
-        .partition(|(name, _)| servers.get(name).is_none_or(|entry| ours(name, entry)));
+    let (wanted, taken): (Map<String, Value>, Map<String, Value>) =
+        mcp_servers(ready).into_iter().partition(|(name, _)| servers.get(name).is_none_or(|entry| ours(name, entry)));
     let current: Map<String, Value> =
         servers.iter().filter(|(name, entry)| ours(name, entry)).map(|(k, v)| (k.clone(), v.clone())).collect();
     let changed = current != wanted;
@@ -411,7 +420,8 @@ pub fn agent_dir() -> Option<PathBuf> {
 
 pub fn sync_agent(root: &Path, agent: &Path) -> Result<bool, String> {
     let grants = Grants::load(root)?;
-    sync_mcp_servers(root, agent, &scan(root).plugins, &grants)
+    let plugins = scan(root).plugins;
+    sync_mcp_servers(root, agent, &ready(&plugins, &grants))
 }
 
 pub(crate) fn absolute(path: &Path) -> PathBuf {

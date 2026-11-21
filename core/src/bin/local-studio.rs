@@ -145,6 +145,7 @@ fn asks(plugin: &Plugin) {
 fn consent_line(plugin: &Plugin, grants: &Grants) -> String {
     match grants.consent(plugin) {
         Consent::Ready => "ready".to_string(),
+        Consent::Refused { reason } => format!("refused, so it gets no capabilities: {reason}"),
         Consent::NeedsConsent { missing } => {
             let names: Vec<&str> = missing.iter().map(|capability| capability.name()).collect();
             format!(
@@ -176,6 +177,7 @@ fn list() -> Result<(), String> {
         if let Some((version, source, granted)) =
             grants.granted(&plugin.id).filter(|(_, _, granted)| !granted.is_empty())
         {
+            let source = if source.is_empty() { "an earlier Local Studio" } else { source };
             println!("  granted {} at {version} to code from {source}", granted.join(", "));
         }
         for skill in &plugin.skills {

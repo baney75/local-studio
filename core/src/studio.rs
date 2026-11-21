@@ -2350,14 +2350,25 @@ impl Actor {
             notes.push(error);
             plugins::Grants::default()
         });
-        for plugin in &scan.plugins {
-            if let plugins::Consent::NeedsConsent { missing } = grants.consent(plugin) {
-                let names: Vec<&str> = missing.iter().map(|capability| capability.name()).collect();
-                notes.push(format!("{} needs consent for {}, so its MCP server is off", plugin.id, names.join(", ")));
+        let ready = plugins::ready(&scan.plugins, &grants);
+        for (plugin, consent) in &ready {
+            match consent {
+                plugins::Consent::Ready => {}
+                plugins::Consent::NeedsConsent { missing } => {
+                    let names: Vec<&str> = missing.iter().map(|capability| capability.name()).collect();
+                    notes.push(format!(
+                        "{} needs consent for {}, so its MCP server is off",
+                        plugin.id,
+                        names.join(", ")
+                    ));
+                }
+                plugins::Consent::Refused { reason } => {
+                    notes.push(format!("{} cannot be granted, so its MCP server is off: {reason}", plugin.id));
+                }
             }
         }
         if let Some(agent) = crate::daemon::agent_dir() {
-            if let Err(error) = plugins::sync_mcp_servers(dir, &agent, &scan.plugins, &grants) {
+            if let Err(error) = plugins::sync_mcp_servers(dir, &agent, &ready) {
                 notes.push(error);
             }
         }

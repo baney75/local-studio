@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -169,7 +170,7 @@ fn place(
     flattened: &[PathBuf],
     origin: &str,
 ) -> Result<Installed, Vec<String>> {
-    let entries = walk(source, exclude, false).map_err(|error| vec![error])?;
+    let entries = walk(source, exclude, Walk::Install).map_err(|error| vec![error])?;
     let unlinked: Vec<String> = entries
         .iter()
         .filter(|entry| matches!(entry.kind, Kind::File { .. }) && flattened.contains(&source.join(&entry.path)))
@@ -187,7 +188,7 @@ fn place(
     if let Some(expected) = expected.filter(|expected| *expected != tree) {
         return Err(vec![format!("tree hash mismatch: the catalog pins {expected}, the fetched plugin is {tree}")]);
     }
-    let refusals = refusals(source, &entries);
+    let refusals = refusals(source, &entries, Walk::Install);
     if !refusals.is_empty() {
         return Err(refusals);
     }
@@ -303,8 +304,32 @@ struct Entry {
 
 /// Finder writes `.DS_Store` into any folder it shows; no runtime loads one, so no hash covers it.
 pub const UNHASHED: &str = ".DS_Store";
+const GIT: &str = ".git";
 
-fn walk(root: &Path, exclude: &[String], keep_git: bool) -> Result<Vec<Entry>, String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    Install,
+    Consent,
+}
+
+fn skipped(path: &Path, walk: Walk) -> bool {
+    walk == Walk::Install && path.starts_with(GIT)
+}
+
+pub(crate) fn named(part: &std::ffi::OsStr, name: &str) -> bool {
+    part.to_str().is_some_and(|part| part.eq_ignore_ascii_case(name))
+}
+
+fn unhashed(real: &Path, walk: Walk) -> bool {
+    real.components().any(|part| named(part.as_os_str(), UNHASHED))
+        || (walk == Walk::Install && real.components().next().is_some_and(|part| named(part.as_os_str(), GIT)))
+}
+
+fn gone(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+}
+
+fn walk(root: &Path, exclude: &[String], mode: Walk) -> Result<Vec<Entry>, String> {
     let excluded: Vec<PathBuf> = exclude
         .iter()
         .map(|relative| inside(Path::new(""), relative).map(|path| path.components().collect()))
@@ -313,15 +338,23 @@ fn walk(root: &Path, exclude: &[String], keep_git: bool) -> Result<Vec<Entry>, S
     let mut pending: Vec<PathBuf> = vec![PathBuf::new()];
     while let Some(relative) = pending.pop() {
         let dir = root.join(&relative);
-        let listing = std::fs::read_dir(&dir).map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+        let listing = match std::fs::read_dir(&dir) {
+            Ok(listing) => listing,
+            Err(error) if gone(&error) && !relative.as_os_str().is_empty() => continue,
+            Err(error) => return Err(format!("cannot read {}: {error}", dir.display())),
+        };
         for item in listing {
             let item = item.map_err(|error| error.to_string())?;
             let name = item.file_name();
             let path = relative.join(&name);
-            if (!keep_git && relative.as_os_str().is_empty() && name == ".git") || excluded.contains(&path) {
+            if skipped(&path, mode) || excluded.contains(&path) {
                 continue;
             }
-            let meta = std::fs::symlink_metadata(item.path()).map_err(|error| error.to_string())?;
+            let meta = match std::fs::symlink_metadata(item.path()) {
+                Ok(meta) => meta,
+                Err(error) if gone(&error) => continue,
+                Err(error) => return Err(error.to_string()),
+            };
             if name == UNHASHED && meta.is_file() {
                 continue;
             }
@@ -332,7 +365,11 @@ fn walk(root: &Path, exclude: &[String], keep_git: bool) -> Result<Vec<Entry>, S
                 .ok_or_else(|| format!("not a UTF-8 path: {}", path.display()))?
                 .join("/");
             let kind = if meta.file_type().is_symlink() {
-                Kind::Link(std::fs::read_link(item.path()).map_err(|error| error.to_string())?)
+                match std::fs::read_link(item.path()) {
+                    Ok(target) => Kind::Link(target),
+                    Err(error) if gone(&error) => continue,
+                    Err(error) => return Err(error.to_string()),
+                }
             } else if meta.is_dir() {
                 pending.push(path);
                 Kind::Dir
@@ -364,31 +401,37 @@ fn stays_inside(link: &str, target: &Path) -> bool {
     true
 }
 
-fn resolves_inside(root: &Path, link: &str) -> bool {
-    let Ok(base) = std::fs::canonicalize(root) else {
-        return false;
-    };
-    std::fs::canonicalize(root.join(link)).is_ok_and(|real| real.starts_with(&base))
+fn resolved(root: &Path, link: &str) -> Option<PathBuf> {
+    let base = std::fs::canonicalize(root).ok()?;
+    let real = std::fs::canonicalize(root.join(link)).ok()?;
+    real.strip_prefix(&base).ok().map(Path::to_path_buf)
 }
 
-fn refusals(root: &Path, entries: &[Entry]) -> Vec<String> {
+fn link_refusal(root: &Path, link: &str, target: &Path, mode: Walk) -> Option<String> {
+    let resolved = resolved(root, link).filter(|_| stays_inside(link, target));
+    match resolved {
+        None => Some(format!("symlink points outside the plugin or nowhere: {link} -> {}", target.display())),
+        Some(real) if unhashed(&real, mode) => {
+            Some(format!("symlink points at a file no hash covers: {link} -> {}", target.display()))
+        }
+        Some(_) => None,
+    }
+}
+
+fn refusals(root: &Path, entries: &[Entry], mode: Walk) -> Vec<String> {
     let mut refusals: Vec<String> = Vec::new();
     for entry in entries {
         match &entry.kind {
-            Kind::Link(target) if !stays_inside(&entry.path, target) || !resolves_inside(root, &entry.path) => {
-                refusals.push(format!(
-                    "symlink points outside the plugin or nowhere: {} -> {}",
-                    entry.path,
-                    target.display()
-                ));
-            }
+            Kind::Link(target) => refusals.extend(link_refusal(root, &entry.path, target, mode)),
             Kind::File { size, .. } if *size > MAX_FILE => {
                 refusals.push(format!("file over 10 MB: {} ({size} bytes)", entry.path));
             }
-            Kind::File { executable: true, .. } if !entry.path.starts_with("bin/") => {
+            Kind::File { executable: true, .. } if mode == Walk::Install && !entry.path.starts_with("bin/") => {
                 refusals.push(format!("executable outside bin/: {}", entry.path));
             }
-            Kind::Other => refusals.push(format!("not a regular file, folder or symlink: {}", entry.path)),
+            Kind::Other if mode == Walk::Install => {
+                refusals.push(format!("not a regular file, folder or symlink: {}", entry.path));
+            }
             _ => {}
         }
     }
@@ -401,7 +444,15 @@ fn hash_entries(root: &Path, entries: &[Entry]) -> Result<String, String> {
         match &entry.kind {
             Kind::File { executable, .. } => {
                 let path = root.join(&entry.path);
-                let bytes = std::fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+                let mut bytes: Vec<u8> = Vec::new();
+                match std::fs::File::open(&path).and_then(|file| file.take(MAX_FILE + 1).read_to_end(&mut bytes)) {
+                    Ok(_) => {}
+                    Err(error) if gone(&error) => continue,
+                    Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+                }
+                if bytes.len() as u64 > MAX_FILE {
+                    return Err(format!("file over 10 MB: {}", entry.path));
+                }
                 let mode = if *executable { "x" } else { "-" };
                 let _ = writeln!(listing, "F {mode} {} {}", hex(&Sha256::digest(&bytes)), entry.path);
             }
@@ -416,12 +467,17 @@ fn hash_entries(root: &Path, entries: &[Entry]) -> Result<String, String> {
 }
 
 pub fn tree_hash(root: &Path, exclude: &[String]) -> Result<String, String> {
-    hash_entries(root, &walk(root, exclude, false)?)
+    hash_entries(root, &walk(root, exclude, Walk::Install)?)
 }
 
 /// The hash consent checks: the whole folder as it is now, `.git` included, so code there is covered too.
 pub(crate) fn live_hash(root: &Path) -> Result<String, String> {
-    hash_entries(root, &walk(root, &[], true)?)
+    let entries = walk(root, &[], Walk::Consent)?;
+    let refused = refusals(root, &entries, Walk::Consent);
+    if !refused.is_empty() {
+        return Err(refused.join("; "));
+    }
+    hash_entries(root, &entries)
 }
 
 fn hex(bytes: &[u8]) -> String {

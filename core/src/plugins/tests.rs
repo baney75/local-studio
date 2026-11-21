@@ -290,13 +290,12 @@ fn untagged_entries_count_as_ours_only_when_they_run_code_under_the_plugins_root
         &json!({ "mcpServers": { "plugin-toolbox": moved, "plugin-broken": broken } }).to_string(),
     );
     sync(&root, &agent);
-    for name in ["plugin-toolbox", "plugin-broken"] {
-        assert_eq!(
-            servers_at(&agent, name),
-            None,
-            "{name} stayed after its command moved or its plugin stopped loading"
-        );
-    }
+    assert_eq!(servers_at(&agent, "plugin-toolbox"), None, "plugin-toolbox stayed after its command moved");
+    assert_eq!(
+        servers_at(&agent, "plugin-broken"),
+        Some(broken),
+        "an entry with only its cwd under the root was removed"
+    );
 
     let mine = json!({"type": "stdio", "command": "/usr/local/bin/toolbox"});
     write(&agent.join("settings.json"), &json!({ "mcpServers": { "plugin-toolbox": mine } }).to_string());
