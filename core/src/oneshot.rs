@@ -5,10 +5,14 @@ use eukhe_types::daemon::{DaemonCommand, DaemonSessionLifecycle, PromptInput};
 use serde_json::{json, Map, Value};
 use tokio::sync::watch;
 
+use crate::session::model_ref;
+use crate::workspace::providers::{claude_signed_in, eukhe_refuses};
+
 #[derive(Clone)]
 pub(crate) struct TextGen {
     client: watch::Receiver<Option<DaemonClient>>,
     session_dir: Option<PathBuf>,
+    agent_dir: Option<PathBuf>,
     home: String,
 }
 
@@ -16,9 +20,10 @@ impl TextGen {
     pub(crate) fn new(
         client: watch::Receiver<Option<DaemonClient>>,
         session_dir: Option<PathBuf>,
+        agent_dir: Option<PathBuf>,
         home: String,
     ) -> Self {
-        Self { client, session_dir, home }
+        Self { client, session_dir, agent_dir, home }
     }
 
     pub(crate) async fn one_shot(
@@ -27,7 +32,9 @@ impl TextGen {
         provider: Option<String>,
         model: Option<String>,
     ) -> Result<String, String> {
+        eukhe_refuses(self.agent_dir.as_deref(), provider.as_deref())?;
         let client = self.client.borrow().clone().ok_or_else(|| "Not connected to the Eukhe daemon.".to_string())?;
+        let unchecked = provider.is_none() && claude_signed_in(self.agent_dir.as_deref());
         let mut config = json!({ "cwd": self.home });
         if let Some(dir) = &self.session_dir {
             config["sessionDir"] = Value::String(dir.to_string_lossy().into_owned());
@@ -57,13 +64,31 @@ impl TextGen {
             .and_then(Value::as_str)
             .ok_or_else(|| "The daemon opened a session without an id.".to_string())?
             .to_string();
-        let answer = ask(&client, &active, prompt).await;
+        let answer = if unchecked {
+            match resolved_provider(&client, &active).await {
+                Ok(resolved) => match eukhe_refuses(self.agent_dir.as_deref(), resolved.as_deref()) {
+                    Ok(()) => ask(&client, &active, prompt).await,
+                    Err(refused) => Err(refused),
+                },
+                Err(error) => Err(error),
+            }
+        } else {
+            ask(&client, &active, prompt).await
+        };
         let killed =
             client.request_ok(DaemonCommand::Kill { id: None, active_session_id: active, rest: Map::default() }).await;
         let answer = answer?;
         killed.map_err(|error| format!("{error:#}"))?;
         Ok(answer)
     }
+}
+
+async fn resolved_provider(client: &DaemonClient, active: &str) -> Result<Option<String>, String> {
+    let state = client
+        .request_ok(DaemonCommand::GetState { id: None, active_session_id: active.to_string(), rest: Map::default() })
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    Ok(state.get("model").and_then(model_ref).map(|model| model.provider))
 }
 
 async fn ask(client: &DaemonClient, active: &str, prompt: String) -> Result<String, String> {

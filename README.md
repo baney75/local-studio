@@ -48,7 +48,7 @@ Needs Xcode 26+, Rust 1.98, and Nushell; the build fetches the pinned Eukhe rele
 
 - macOS 26+ (Apple Silicon) and Linux only.
 - Not sandboxed: agents run code with your user permissions.
-- Subscription sign-in (ChatGPT, Claude, GitHub Copilot) happens in Eukhe (`eukhe`, then `/login`).
+- Subscription sign-in for ChatGPT and GitHub Copilot happens in Eukhe (`eukhe`, then `/login`). Claude runs only through Claude Code and your `claude` sign-in ([docs/harness.md](docs/harness.md)); Local Studio hides Eukhe's Claude sign-in because it identifies as Claude Code and can get the account restricted. Anthropic API keys still work in Eukhe.
 
 ## Credits
 

@@ -44,8 +44,14 @@ pub fn present(app: &Rc<App>) {
     if !state.providers.iter().any(|provider| provider.configured) {
         let row = adw::ActionRow::builder()
             .title("No provider is ready yet")
-            .subtitle("Paste an API key or add an OpenAI-compatible endpoint in Settings → Providers, or run eukhe in a terminal and use /login for a subscription, then check again.")
+            .subtitle("Paste an API key or add an OpenAI-compatible endpoint in Settings → Providers, or run eukhe in a terminal and use /login for a ChatGPT or Copilot subscription, then check again. For Claude, use Claude Code (your <tt>claude</tt> sign-in).")
             .build();
+        providers.add(&row);
+    }
+    for error in &state.provider_errors {
+        let row = adw::ActionRow::builder().title(format::escape(error)).build();
+        row.add_css_class("ls-provider-warning");
+        row.add_prefix(&icons::image(icons::WARNING));
         providers.add(&row);
     }
     let add_provider = adw::ButtonRow::builder().title("Add Provider…").action_name("win.provider-settings").build();

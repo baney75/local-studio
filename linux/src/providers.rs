@@ -391,9 +391,15 @@ fn engine_row(app: &Weak<App>, state: &State, engine: &LocalEngine) -> adw::Acti
 
 pub fn signin_group() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder().title("Subscriptions").build();
+    let claude = adw::ActionRow::builder()
+        .title("Claude")
+        .subtitle("Use Claude Code (your <tt>claude</tt> sign-in) for a Claude subscription. Local Studio does not use Eukhe's Claude sign-in: it identifies as Claude Code and can get the account restricted.")
+        .build();
+    claude.add_prefix(&icons::image(icons::TERMINAL));
+    group.add(&claude);
     let row = adw::ActionRow::builder()
         .title("Sign in from a terminal")
-        .subtitle("Subscriptions such as ChatGPT, Claude or GitHub Copilot sign in from a terminal: run eukhe and use /login, then Refresh Providers.")
+        .subtitle("Subscriptions such as ChatGPT or GitHub Copilot sign in from a terminal: run eukhe and use /login, then Refresh Providers.")
         .build();
     row.add_prefix(&icons::image(icons::TERMINAL));
     let open = gtk::Button::builder()

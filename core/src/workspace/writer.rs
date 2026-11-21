@@ -2,7 +2,9 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use super::model::{Settings, WritingStyle};
+use super::providers::CLAUDE_SIGN_IN;
 use super::{git, Workspace};
+use crate::model::NoticeLevel;
 
 fn writer_model(settings: &Settings) -> Option<(Option<String>, String)> {
     let model = settings.source_control_model.clone().or_else(|| settings.text_generation_model.clone())?;
@@ -47,7 +49,14 @@ fn clean_reply(reply: &str) -> String {
 impl Workspace {
     async fn write_text(&self, settings: &Settings, prompt: String) -> Option<String> {
         let (provider, model) = writer_model(settings)?;
-        let reply = self.inner.text.one_shot(prompt, provider, Some(model)).await.ok()?;
+        let reply = match self.inner.text.one_shot(prompt, provider, Some(model)).await {
+            Ok(reply) => reply,
+            Err(refused) if refused == CLAUDE_SIGN_IN => {
+                self.inner.mailbox.notice(NoticeLevel::Warning, format!("Skipped the generated text. {refused}"));
+                return None;
+            }
+            Err(_) => return None,
+        };
         Some(clean_reply(&reply)).filter(|text| !text.is_empty())
     }
 

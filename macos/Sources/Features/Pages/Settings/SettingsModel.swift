@@ -366,7 +366,7 @@ enum SettingKey: CaseIterable {
         case .localEngines: "engine controller fleet gpu use"
         case .providers: "auth configured catalog"
         case .favorites: "models star"
-        case .signIn: "login auth eukhe"
+        case .signIn: "login auth eukhe claude subscription"
         case .hiddenModels: "hide unhide picker models"
         case .autoPull: "fast-forward"
         case .fetchInterval: "background refresh"

@@ -62,8 +62,12 @@ struct OnboardingView: View {
                     ForEach(onboardingProviders, id: \.id) { provider in
                         StatusLine(tint: provider.configured ? Theme.success : Theme.tertiaryText, symbol: provider.configured ? "checkmark" : "minus", text: "\(provider.name) · \(provider.modelCount) model\(provider.modelCount == 1 ? "" : "s")")
                     }
+                    ForEach(store.pages.providerErrors, id: \.self) { error in
+                        IconLabel(error, symbol: "exclamationmark.triangle.fill")
+                            .foregroundStyle(Theme.warning)
+                    }
                     if configuredProviders == 0 {
-                        Text("Paste an API key or add an OpenAI-compatible endpoint in Settings → Providers, or run `eukhe` in Terminal and use `/login` for a subscription, then check again.")
+                        Text("Paste an API key or add an OpenAI-compatible endpoint in Settings → Providers, or run `eukhe` in Terminal and use `/login` for a ChatGPT or Copilot subscription, then check again. For Claude, use Claude Code (your `claude` sign-in).")
                             .font(.system(size: 12))
                             .foregroundStyle(Theme.secondaryText)
                             .fixedSize(horizontal: false, vertical: true)

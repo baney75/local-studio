@@ -144,7 +144,11 @@ struct ProvidersSettings: View {
                 SettingRow(.signIn) {
                     SettingsNote(
                         symbol: "terminal",
-                        text: "Subscriptions such as ChatGPT, Claude or GitHub Copilot sign in from Terminal: run `eukhe` and use `/login`, then Refresh Providers."
+                        text: "Use Claude Code (your `claude` sign-in) for a Claude subscription. Local Studio does not use Eukhe's Claude sign-in: it identifies as Claude Code and can get the account restricted."
+                    )
+                    SettingsNote(
+                        symbol: "terminal",
+                        text: "Subscriptions such as ChatGPT or GitHub Copilot sign in from Terminal: run `eukhe` and use `/login`, then Refresh Providers."
                     )
                     HStack {
                         Spacer()
