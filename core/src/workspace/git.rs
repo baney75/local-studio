@@ -213,8 +213,7 @@ pub(crate) async fn create_worktree(
         suffix += 1;
     }
     let path_text = path.to_string_lossy().into_owned();
-    let reference = format!("refs/heads/{branch}");
-    let exists = git(project, &["show-ref", "--verify", "--quiet", &reference], QUICK).await.is_ok();
+    let exists = branch_exists(project, branch).await;
     let mut args = vec!["worktree", "add"];
     if exists {
         args.extend(["--", path_text.as_str(), branch]);
@@ -226,6 +225,15 @@ pub(crate) async fn create_worktree(
     }
     git(project, &args, SLOW).await?;
     Ok(path)
+}
+
+pub(crate) async fn branch_exists(project: &Path, branch: &str) -> bool {
+    let reference = format!("refs/heads/{}", branch.trim());
+    git(project, &["show-ref", "--verify", "--quiet", &reference], QUICK).await.is_ok()
+}
+
+pub(crate) async fn delete_branch(project: &Path, branch: &str) -> Result<(), String> {
+    git(project, &["branch", "--delete", "--force", "--", branch.trim()], QUICK).await.map(drop)
 }
 
 async fn has_head(project: &Path) -> bool {

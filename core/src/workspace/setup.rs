@@ -334,6 +334,27 @@ impl Workspace {
     }
 }
 
+impl Workspace {
+    pub(crate) async fn branch_exists(&self, project: &Path, branch: &str) -> bool {
+        git::branch_exists(project, branch).await
+    }
+
+    /// Undoes the worktree `prepare_worktree` made for a thread that will not start: stops its setup scripts,
+    /// removes the worktree, and deletes `branch` when this start created it.
+    pub(crate) async fn discard_worktree(&self, draft: &str, project: &Path, worktree: &Path, branch: Option<&str>) {
+        self.inner.setups.signal(draft, Signal::Cancel);
+        if let Err(error) = git::remove_worktree(project, worktree).await {
+            self.inner.mailbox.notice(NoticeLevel::Warning, format!("Worktree kept: {error}"));
+            return;
+        }
+        if let Some(branch) = branch {
+            if let Err(error) = git::delete_branch(project, branch).await {
+                self.inner.mailbox.notice(NoticeLevel::Warning, format!("Branch {branch} kept: {error}"));
+            }
+        }
+    }
+}
+
 struct SetupRun {
     workspace: Workspace,
     scripts: Vec<ProjectScript>,
