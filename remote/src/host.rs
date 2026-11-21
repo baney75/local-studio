@@ -7,7 +7,7 @@ use anyhow::Context;
 use local_studio_core::Studio;
 use serde_json::json;
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, watch, Notify};
+use tokio::sync::{watch, Notify};
 
 use crate::devices::{self, Devices};
 use crate::hub::{self, Feed, Hub};
@@ -22,6 +22,7 @@ const BIND_RETRY: Duration = Duration::from_millis(200);
 const RELOAD_EVERY: Duration = Duration::from_secs(2);
 const DRAIN_POLL: Duration = Duration::from_millis(20);
 const STOP_WITHIN: Duration = Duration::from_secs(2);
+const WAIT_EVERY: Duration = Duration::from_secs(1);
 const GOING_AWAY: u16 = 1001;
 const RESTARTING: u16 = 1012;
 
@@ -214,7 +215,7 @@ impl Watcher {
 }
 
 pub struct Handle {
-    stop: Option<oneshot::Sender<()>>,
+    stop: Option<watch::Sender<bool>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -225,7 +226,7 @@ impl Handle {
 
     fn halt(&mut self) {
         if let Some(stop) = self.stop.take() {
-            stop.send(()).ok();
+            stop.send_replace(true);
         }
         if let Some(thread) = self.thread.take() {
             thread.join().ok();
@@ -239,30 +240,104 @@ impl Drop for Handle {
     }
 }
 
-pub fn start(studio: Arc<Studio>, data_dir: Option<&Path>) -> anyhow::Result<Option<Handle>> {
-    let explicit = data_dir.map(|dir| dir.to_string_lossy().into_owned());
-    let data_dir = local_studio_core::data_dir(explicit.as_deref()).map_err(|message| anyhow::anyhow!(message))?;
-    if !settings::exists(&data_dir) {
-        return Ok(None);
+enum Session {
+    Stopped,
+    Ended,
+    Failed(String),
+}
+
+async fn settled(data_dir: &Path, present: bool, stop: &mut watch::Receiver<bool>) -> bool {
+    loop {
+        if *stop.borrow() {
+            return false;
+        }
+        if settings::exists(data_dir) == present {
+            return true;
+        }
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+            }
+            () = tokio::time::sleep(WAIT_EVERY) => {}
+        }
     }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+}
+
+async fn session(studio: &Arc<Studio>, data_dir: &Path, stop: &mut watch::Receiver<bool>) -> Session {
+    if !settled(data_dir, true, stop).await {
+        return Session::Stopped;
+    }
+    let (waker, notify) = hub::signal();
+    let feed = Feed::Subscription(studio.subscribe(waker));
+    let launch = Launch {
+        studio: Arc::clone(studio),
+        feed,
+        notify,
+        data_dir: data_dir.to_path_buf(),
+        flags: Settings::default(),
+        reload: None,
+    };
+    let served = run(launch, async {
+        if settled(data_dir, false, stop).await {
+            eprintln!("local-studio-serve: serve.json was removed: stopping the in-process server");
+        }
+        Stop::HandOver
+    })
+    .await;
+    if *stop.borrow() {
+        return Session::Stopped;
+    }
+    match served {
+        Ok(_) => Session::Ended,
+        Err(error) => {
+            let message = format!("{error:#}");
+            tokio::select! {
+                _ = stop.changed() => {}
+                () = tokio::time::sleep(WAIT_EVERY) => {}
+            }
+            Session::Failed(message)
+        }
+    }
+}
+
+fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("local-studio-remote")
         .enable_all()
-        .build()?;
-    let (stop, stopped) = oneshot::channel::<()>();
+        .build()
+}
+
+pub fn start(studio: Arc<Studio>, data_dir: Option<&Path>) -> anyhow::Result<Option<Handle>> {
+    let explicit = data_dir.map(|dir| dir.to_string_lossy().into_owned());
+    let data_dir = local_studio_core::data_dir(explicit.as_deref()).map_err(|message| anyhow::anyhow!(message))?;
+    let mut first = Some(runtime()?);
+    let (stop, mut stopped) = watch::channel(false);
     let thread = std::thread::Builder::new().name("local-studio-remote".to_string()).spawn(move || {
-        let (waker, notify) = hub::signal();
-        let feed = Feed::Subscription(studio.subscribe(waker));
-        let launch = Launch { studio, feed, notify, data_dir, flags: Settings::default(), reload: None };
-        let served = runtime.block_on(run(launch, async {
-            stopped.await.ok();
-            Stop::HandOver
-        }));
-        if let Err(error) = served {
-            eprintln!("local-studio-serve: the in-process server stopped: {error:#}");
+        let mut reported: Option<String> = None;
+        loop {
+            let runtime = match first.take().map_or_else(runtime, Ok) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("local-studio-serve: the in-process server stopped: {error:#}");
+                    return;
+                }
+            };
+            let outcome = runtime.block_on(session(&studio, &data_dir, &mut stopped));
+            runtime.shutdown_timeout(STOP_WITHIN);
+            match outcome {
+                Session::Stopped => return,
+                Session::Ended => reported = None,
+                Session::Failed(message) => {
+                    if reported.as_ref() != Some(&message) {
+                        eprintln!("local-studio-serve: the in-process server stopped: {message}");
+                        reported = Some(message);
+                    }
+                }
+            }
         }
-        runtime.shutdown_timeout(STOP_WITHIN);
     })?;
     Ok(Some(Handle { stop: Some(stop), thread: Some(thread) }))
 }
